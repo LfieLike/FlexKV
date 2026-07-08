@@ -103,8 +103,9 @@ class HierarchyLRCacheEngine:
         # SWA (Sliding Window Attention) — node-mounted on the radix tree (see
         # CacheEngineAccel). This hierarchical/distributed tier does not (yet)
         # carry node-mounted SWA state in its remote radix index, so SWA stays
-        # effectively disabled here: init_swa builds the host pool but match_swa
-        # only reports a hit when the underlying index exposes last_swa_node.
+        # effectively disabled here: init_swa builds the host pool but
+        # _resolve_swa_hit only reports a hit when the underlying index exposes
+        # last_swa_node.
         # DSv4 uses CacheEngineAccel (index_accel), not this engine.
         self.swa_pool = None
         tier_swa_config = (swa_config.for_cache_tier(device_type)
@@ -131,17 +132,17 @@ class HierarchyLRCacheEngine:
             if slot is not None and slot >= 0:
                 self.swa_pool.free(int(slot))
 
-    def match_swa(self,
-                  sequence_meta: "SequenceMeta",
-                  upper_bound_blocks: int,
-                  lock_for_load: bool = False):
-        """Node-mounted SWA match. Returns no-hit unless the (remote) radix index
-        exposes last_swa_node on its match result."""
+    def _resolve_swa_hit(self,
+                         sequence_meta: "SequenceMeta",
+                         upper_bound_blocks: int,
+                         lock_for_load: bool = False,
+                         match_result=None):
+        """Node-mounted SWA hit resolver no-op for hierarchical remote indexes."""
         if self.swa_pool is None or upper_bound_blocks <= 0:
-            return 0, -1
+            return 0, -1, None
         # The distributed/remote radix index does not surface node-mounted SWA
         # yet; report no hit (SWA is served by the accel CPU tier for DSv4).
-        return 0, -1
+        return 0, -1, None
 
     def start(self) -> None:
         if self._meta is None:
