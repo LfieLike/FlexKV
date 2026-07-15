@@ -9,7 +9,7 @@ import torch
 import zmq
 import numpy as np
 
-from flexkv.common.config import ModelConfig, CacheConfig
+from flexkv.common.config import CacheConfig, LayerGroupSpec, ModelConfig
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout
@@ -308,6 +308,9 @@ class KVTPClient:
         override_device_id: Optional[int] = None,
         indexer_buffers: Optional[List[torch.Tensor]] = None,
         indexer_layout: Optional[KVCacheLayout] = None,
+        layer_groups: Optional[List[LayerGroupSpec]] = None,
+        gpu_layouts_per_group: Optional[List[KVCacheLayout]] = None,
+        gpu_blocks_per_group: Optional[List[List[torch.Tensor]]] = None,
     ) -> None:
         if not kv_caches or not kv_caches[0].is_cuda:
             raise ValueError("GPU blocks must be CUDA tensors")
@@ -327,6 +330,106 @@ class KVTPClient:
             for tensor in indexer_buffers:
                 indexer_handles.append(TensorSharedHandle(tensor, device_id))
 
+        multi_group_values = (
+            layer_groups,
+            gpu_layouts_per_group,
+            gpu_blocks_per_group,
+        )
+        has_any_multi_group = any(value is not None for value in multi_group_values)
+        has_all_multi_group = all(value is not None for value in multi_group_values)
+        if has_any_multi_group and not has_all_multi_group:
+            raise ValueError(
+                "layer_groups, gpu_layouts_per_group and "
+                "gpu_blocks_per_group must be provided together"
+            )
+        if has_all_multi_group and (
+            indexer_buffers is not None or indexer_layout is not None
+        ):
+            raise ValueError(
+                "multi-group registration already represents indexer/sidecar "
+                "pools; legacy indexer_buffers/indexer_layout must be unset"
+            )
+
+        handles_per_group = None
+        if has_all_multi_group:
+            assert layer_groups is not None
+            assert gpu_layouts_per_group is not None
+            assert gpu_blocks_per_group is not None
+            num_groups = len(layer_groups)
+            if num_groups == 0:
+                raise ValueError("multi-group registration requires at least one group")
+            if len(gpu_layouts_per_group) != num_groups:
+                raise ValueError(
+                    "gpu_layouts_per_group count does not match layer_groups: "
+                    f"{len(gpu_layouts_per_group)} != {num_groups}"
+                )
+            if len(gpu_blocks_per_group) != num_groups:
+                raise ValueError(
+                    "gpu_blocks_per_group count does not match layer_groups: "
+                    f"{len(gpu_blocks_per_group)} != {num_groups}"
+                )
+            handles_per_group = []
+            for group_idx, (group, group_layout, group_tensors) in enumerate(zip(
+                layer_groups,
+                gpu_layouts_per_group,
+                gpu_blocks_per_group,
+            )):
+                if (
+                    group.compress_ratio < 1
+                    or kv_layout.tokens_per_block % group.compress_ratio != 0
+                ):
+                    raise ValueError(
+                        f"layer_groups[{group_idx}].compress_ratio must be "
+                        "positive and divide the aggregate tokens_per_block"
+                    )
+                if not group_tensors:
+                    raise ValueError(
+                        f"gpu_blocks_per_group[{group_idx}] must not be empty"
+                    )
+                if any(not tensor.is_cuda for tensor in group_tensors):
+                    raise ValueError(
+                        f"gpu_blocks_per_group[{group_idx}] contains a non-CUDA tensor"
+                    )
+                valid_tensor_counts = {
+                    1,
+                    group.num_layers,
+                    group.num_layers * 2,
+                }
+                if len(group_tensors) not in valid_tensor_counts:
+                    raise ValueError(
+                        f"gpu_blocks_per_group[{group_idx}] has "
+                        f"{len(group_tensors)} tensors; expected one packed "
+                        f"tensor, {group.num_layers} layer tensors, or "
+                        f"{group.num_layers * 2} K/V layer tensors"
+                    )
+                expected_tokens = (
+                    kv_layout.tokens_per_block // group.compress_ratio
+                )
+                if (
+                    group_layout.layer_groups is not None
+                    or group_layout.num_layer != group.num_layers
+                    or group_layout.num_block != kv_layout.num_block
+                    or group_layout.tokens_per_block != expected_tokens
+                    or group_layout.num_head != group.num_kv_heads
+                    or group_layout.head_size != group.head_size
+                    or group_layout.is_mla != kv_layout.is_mla
+                ):
+                    raise ValueError(
+                        f"gpu_layouts_per_group[{group_idx}] does not match "
+                        "its LayerGroupSpec or aggregate GPU layout"
+                    )
+                if group.dtype is not None and any(
+                    tensor.dtype != group.dtype for tensor in group_tensors
+                ):
+                    raise ValueError(
+                        f"gpu_blocks_per_group[{group_idx}] dtype does not "
+                        f"match LayerGroupSpec.dtype={group.dtype}"
+                    )
+                handles_per_group.append([
+                    TensorSharedHandle(tensor, device_id)
+                    for tensor in group_tensors
+                ])
+
         register_req = RegisterTPClientRequest(
             dp_client_id=self.dp_client_id,
             pp_rank=self.pp_rank,
@@ -336,6 +439,9 @@ class KVTPClient:
             gpu_layout=kv_layout,
             indexer_handles=indexer_handles,
             indexer_gpu_layout=indexer_layout,
+            layer_groups=layer_groups,
+            gpu_layouts_per_group=gpu_layouts_per_group,
+            handles_per_group=handles_per_group,
         )
 
         try:
@@ -343,7 +449,8 @@ class KVTPClient:
             flexkv_logger.info(
                 f"KVTPClient {device_id}: registration message sent "
                 f"(dp_client_id={self.dp_client_id}, pp_rank={self.pp_rank}, "
-                f"num_kv_caches={len(kv_caches)})")
+                f"num_kv_caches={len(kv_caches)}, "
+                f"num_layer_groups={len(layer_groups) if layer_groups else 0})")
         except zmq.Again:
             flexkv_logger.error(
                 f"KVTPClient {device_id}: zmq.Again when sending registration "

@@ -37,7 +37,12 @@ from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
 from flexkv.common.transfer import TransferOp, TransferType, PartitionBlockType
 from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
-from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig
+from flexkv.common.config import (
+    GLOBAL_CONFIG_FROM_ENV,
+    CacheConfig,
+    LayerGroupSpec,
+    MooncakeTransferEngineConfig,
+)
 from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
 from flexkv.transfer.host_buffer import (
     allocate_host_buffer,
@@ -642,6 +647,276 @@ class tpGPUCPUTransferWorker(TransferWorkerBase):
             dst_block_ids=dst_block_ids, op=transfer_op)
         return True
 
+
+class MultiGroupGPUCPUTransferWorker(TransferWorkerBase):
+    """GPU<->CPU worker for byte-flat heterogeneous cache groups.
+
+    One ``TPTransferThreadGroup`` is created per heterogeneous group. The CPU
+    pointer for each group starts at that group's byte offset inside a TP slice,
+    while every group retains the full logical block stride.
+    """
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Connection,
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor: torch.Tensor,
+        cpu_blocks: Union[torch.Tensor, HugePageTensorHandle],
+        cpu_kv_layout: KVCacheLayout,
+        layer_groups: List[LayerGroupSpec],
+        gpu_blocks_per_group: List[List[List[TensorSharedHandle]]],
+        gpu_layouts_per_group: List[List[KVCacheLayout]],
+        tp_group_size: int,
+        use_ce_transfer_h2d: bool = False,
+        use_ce_transfer_d2h: bool = False,
+        transfer_num_cta_h2d: int = 4,
+        transfer_num_cta_d2h: int = 4,
+    ) -> None:
+        super().__init__(
+            worker_id,
+            transfer_conn,
+            finished_ops_queue,
+            op_buffer_tensor,
+        )
+        if cpu_kv_layout.layer_groups != layer_groups:
+            raise ValueError(
+                "multi-group GPUCPU worker requires matching CPU layer_groups"
+            )
+        if cpu_kv_layout.type != KVCacheLayoutType.BLOCKFIRST:
+            raise ValueError(
+                "multi-group GPUCPU worker requires BLOCKFIRST CPU storage"
+            )
+        if len(gpu_blocks_per_group) != len(layer_groups):
+            raise ValueError("GPU group handle count does not match layer_groups")
+        if len(gpu_layouts_per_group) != len(layer_groups):
+            raise ValueError("GPU group layout count does not match layer_groups")
+        if tp_group_size < 1:
+            raise ValueError("tp_group_size must be positive")
+
+        cpu_blocks = materialize_worker_tensor(cpu_blocks)
+        if cpu_blocks.element_size() != 1:
+            raise ValueError(
+                "multi-group CPU buffer must use a one-byte backing dtype"
+            )
+        cudaHostRegister(cpu_blocks)
+
+        self.cpu_blocks = cpu_blocks
+        self.tp_group_size = tp_group_size
+        self.is_mla = cpu_kv_layout.is_mla
+        self.kv_dim = cpu_kv_layout.kv_dim
+        self.mla_d2h_mode = GLOBAL_CONFIG_FROM_ENV.mla_d2h_mode
+        self.use_ce_transfer_h2d = use_ce_transfer_h2d
+        self.use_ce_transfer_d2h = use_ce_transfer_d2h
+        self.transfer_num_cta_h2d = transfer_num_cta_h2d
+        self.transfer_num_cta_d2h = transfer_num_cta_d2h
+
+        block_stride = cpu_kv_layout.get_block_stride()
+        if block_stride % tp_group_size != 0:
+            raise ValueError(
+                f"CPU block stride {block_stride} is not divisible by "
+                f"tp_group_size={tp_group_size}"
+            )
+        cpu_tp_stride = block_stride // tp_group_size
+
+        self.group_transfer_params: List[Dict[str, Any]] = []
+        group_offset_bytes = 0
+        flat_cpu = cpu_blocks.flatten()
+
+        for group_idx, group in enumerate(layer_groups):
+            if group.dtype is None:
+                raise ValueError(
+                    f"layer_groups[{group_idx}].dtype must be resolved"
+                )
+            device_handles = gpu_blocks_per_group[group_idx]
+            device_layouts = gpu_layouts_per_group[group_idx]
+            if len(device_handles) != tp_group_size:
+                raise ValueError(
+                    f"group {group_idx} has {len(device_handles)} devices; "
+                    f"expected {tp_group_size}"
+                )
+            if len(device_layouts) != tp_group_size:
+                raise ValueError(
+                    f"group {group_idx} has {len(device_layouts)} layouts; "
+                    f"expected {tp_group_size}"
+                )
+            expected_tokens = (
+                cpu_kv_layout.tokens_per_block // group.compress_ratio
+            )
+            for device_idx, layout in enumerate(device_layouts):
+                if (
+                    layout.layer_groups is not None
+                    or layout.num_layer != group.num_layers
+                    or layout.tokens_per_block != expected_tokens
+                    or layout.num_head != group.num_kv_heads
+                    or layout.head_size != group.head_size
+                    or layout.is_mla != cpu_kv_layout.is_mla
+                ):
+                    raise ValueError(
+                        f"group {group_idx} device {device_idx} GPU layout "
+                        "does not match its LayerGroupSpec"
+                    )
+
+            imported_per_device: List[List[torch.Tensor]] = []
+            for handles in device_handles:
+                if not handles:
+                    raise ValueError(
+                        f"group {group_idx} contains an empty device handle list"
+                    )
+                imported_per_device.append([
+                    handle.get_tensor() for handle in handles
+                ])
+            if any(
+                tensor.dtype != group.dtype
+                for tensors in imported_per_device
+                for tensor in tensors
+            ):
+                raise ValueError(
+                    f"group {group_idx} GPU tensor dtype does not match "
+                    f"LayerGroupSpec.dtype={group.dtype}"
+                )
+
+            tensors_per_device = len(imported_per_device[0])
+            if any(
+                len(tensors) != tensors_per_device
+                for tensors in imported_per_device
+            ):
+                raise ValueError(
+                    f"group {group_idx} tensor count differs across devices"
+                )
+
+            dtype_size = group.dtype.itemsize
+            gpu_kv_strides = [
+                layout.get_kv_stride() * dtype_size
+                for layout in device_layouts
+            ]
+            gpu_block_strides = [
+                layout.get_block_stride() * dtype_size
+                for layout in device_layouts
+            ]
+            gpu_layer_strides = [
+                layout.get_layer_stride() * dtype_size
+                for layout in device_layouts
+            ]
+            gpu_chunk_sizes = [
+                layout.get_chunk_size() * dtype_size
+                for layout in device_layouts
+            ]
+            gpu_ptrs_flat = [
+                tensor.data_ptr()
+                for tensors in imported_per_device
+                for tensor in tensors
+            ]
+            gpu_device_ids = [
+                tensors[0].device.index for tensors in imported_per_device
+            ]
+
+            group_thread = TPTransferThreadGroup(
+                tp_group_size,
+                gpu_ptrs_flat,
+                tensors_per_device,
+                flat_cpu[group_offset_bytes:].data_ptr(),
+                group.num_layers,
+                gpu_kv_strides,
+                gpu_block_strides,
+                gpu_layer_strides,
+                gpu_chunk_sizes,
+                gpu_device_ids,
+            )
+
+            group_tokens = (
+                cpu_kv_layout.tokens_per_block // group.compress_ratio
+            )
+            chunk_size = (
+                group_tokens
+                * group.num_kv_heads
+                * group.head_size
+                * dtype_size
+            )
+            layer_stride = self.kv_dim * chunk_size
+            self.group_transfer_params.append({
+                "thread_group": group_thread,
+                "cpu_kv_stride": chunk_size,
+                "cpu_layer_stride": layer_stride,
+                "cpu_block_stride": block_stride,
+                "cpu_tp_stride": cpu_tp_stride,
+                "num_layers": group.num_layers,
+                "chunk_size": chunk_size,
+            })
+            group_offset_bytes += group.num_layers * layer_stride
+
+        if group_offset_bytes * cpu_kv_layout.tp_size != block_stride:
+            raise ValueError(
+                "multi-group GPUCPU stride table does not fill the CPU block"
+            )
+
+    def _transfer_impl(
+        self,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
+        transfer_type: TransferType,
+    ) -> None:
+        if transfer_type == TransferType.H2D:
+            gpu_block_ids = dst_block_ids
+            cpu_block_ids = src_block_ids
+            transfer_cta = self.transfer_num_cta_h2d
+            use_ce = self.use_ce_transfer_h2d
+            is_h2d = True
+        elif transfer_type == TransferType.D2H:
+            gpu_block_ids = src_block_ids
+            cpu_block_ids = dst_block_ids
+            transfer_cta = self.transfer_num_cta_d2h
+            use_ce = self.use_ce_transfer_d2h
+            is_h2d = False
+        else:
+            raise ValueError(
+                f"invalid multi-group GPUCPU transfer type: {transfer_type}"
+            )
+
+        if len(gpu_block_ids) == 0:
+            return
+        for params in self.group_transfer_params:
+            params["thread_group"].tp_group_transfer(
+                gpu_block_ids,
+                cpu_block_ids,
+                params["cpu_kv_stride"],
+                params["cpu_layer_stride"],
+                params["cpu_block_stride"],
+                params["cpu_tp_stride"],
+                transfer_cta,
+                is_h2d,
+                use_ce,
+                0,
+                params["num_layers"],
+                self.is_mla,
+                self.mla_d2h_mode,
+            )
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+        start_time = time.time()
+        self._transfer_impl(
+            src_block_ids,
+            dst_block_ids,
+            transfer_op.transfer_type,
+        )
+        end_time = time.time()
+        transfer_size = sum(
+            params["chunk_size"]
+            * params["num_layers"]
+            * self.kv_dim
+            * transfer_op.valid_block_num
+            for params in self.group_transfer_params
+        )
+        self._log_transfer_performance(
+            transfer_op,
+            transfer_size,
+            start_time,
+            end_time,
+        )
+        return True
+
+
 class CPUSSDDiskTransferWorker(TransferWorkerBase):
     def __init__(self,
                  worker_id: int,
@@ -655,7 +930,8 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
                  dtype: torch.dtype,
                  num_blocks_per_file: int,
                  cache_config: CacheConfig,
-                 compressor: Optional[CompressionStrategy] = None):
+                 compressor: Optional[CompressionStrategy] = None,
+                 layer_groups: Optional[List[LayerGroupSpec]] = None):
         super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
         cpu_blocks = materialize_worker_tensor(cpu_blocks)
         self.ssd_files = ssd_files
@@ -674,18 +950,51 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
         self.is_mla = cpu_kv_layout.is_mla
         self.kv_dim = cpu_kv_layout.kv_dim
         self.cpu_layout_type = cpu_kv_layout.type
+        self.has_multi_group = layer_groups is not None
 
         if cpu_kv_layout.type != ssd_kv_layout.type:
             raise ValueError("no support for different CPU and SSD KV cache layout type")
 
-        ssd_kv_layout_per_file = ssd_kv_layout.div_block(self.num_files, padding=True)
-
-        self.chunk_size_in_bytes = cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
-        self.block_stride_in_bytes = cpu_kv_layout.get_block_stride() * self.dtype.itemsize
-        self.cpu_kv_stride_in_bytes = cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
-        self.cpu_layer_stride_in_bytes = cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
-        self.ssd_kv_stride_in_bytes = ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
-        self.ssd_layer_stride_in_bytes = ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+        if self.has_multi_group:
+            if cpu_kv_layout.layer_groups != layer_groups:
+                raise ValueError(
+                    "multi-group CPU layout does not match layer_groups"
+                )
+            if ssd_kv_layout.layer_groups != layer_groups:
+                raise ValueError(
+                    "multi-group SSD layout does not match layer_groups"
+                )
+            if cpu_kv_layout.type != KVCacheLayoutType.BLOCKFIRST:
+                raise ValueError(
+                    "multi-group CPU/SSD transfer requires BLOCKFIRST"
+                )
+            self.block_stride_in_bytes = cpu_kv_layout.get_block_stride()
+            if self.block_stride_in_bytes != ssd_kv_layout.get_block_stride():
+                raise ValueError(
+                    "multi-group CPU and SSD block strides must match"
+                )
+        else:
+            ssd_kv_layout_per_file = ssd_kv_layout.div_block(
+                self.num_files, padding=True
+            )
+            self.chunk_size_in_bytes = (
+                cpu_kv_layout.get_chunk_size() * self.dtype.itemsize
+            )
+            self.block_stride_in_bytes = (
+                cpu_kv_layout.get_block_stride() * self.dtype.itemsize
+            )
+            self.cpu_kv_stride_in_bytes = (
+                cpu_kv_layout.get_kv_stride() * self.dtype.itemsize
+            )
+            self.cpu_layer_stride_in_bytes = (
+                cpu_kv_layout.get_layer_stride() * self.dtype.itemsize
+            )
+            self.ssd_kv_stride_in_bytes = (
+                ssd_kv_layout_per_file.get_kv_stride() * self.dtype.itemsize
+            )
+            self.ssd_layer_stride_in_bytes = (
+                ssd_kv_layout_per_file.get_layer_stride() * self.dtype.itemsize
+            )
 
         try:
             self.ioctx = c_ext.SSDIOCTX(ssd_files, len(ssd_files), GLOBAL_CONFIG_FROM_ENV.iouring_entries,
@@ -718,26 +1027,49 @@ class CPUSSDDiskTransferWorker(TransferWorkerBase):
             raise ValueError(f"Invalid transfer type: {transfer_type} for CPUSSDDiskTransferWorker")
 
 
-        layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
-
-        transfer_kv_blocks_ssd(
-            ioctx=self.ioctx,
-            cpu_layer_id_list=layer_id_list,
-            cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
-            ssd_block_ids=ssd_block_id_list,
-            cpu_block_ids=cpu_block_id_list,
-            cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
-            cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
-            ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
-            ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
-            chunk_size_in_bytes=self.chunk_size_in_bytes,
-            block_stride_in_bytes=self.block_stride_in_bytes,
-            is_read=(transfer_type == TransferType.DISK2H),
-            num_blocks_per_file=self.num_blocks_per_file,
-            round_robin=self.round_robin,
-            num_threads_per_device=32,
-            is_mla=self.is_mla,
-        )
+        is_read = transfer_type == TransferType.DISK2H
+        if self.has_multi_group:
+            # CPU and SSD share one byte-flat BLOCKFIRST representation. Move
+            # the complete logical block as an opaque byte range so compressed
+            # groups never issue tiny independent IO operations.
+            transfer_kv_blocks_ssd(
+                ioctx=self.ioctx,
+                cpu_layer_id_list=torch.tensor([0], dtype=torch.int32),
+                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
+                ssd_block_ids=ssd_block_id_list,
+                cpu_block_ids=cpu_block_id_list,
+                cpu_layer_stride_in_bytes=self.block_stride_in_bytes,
+                cpu_kv_stride_in_bytes=0,
+                ssd_layer_stride_in_bytes=self.block_stride_in_bytes,
+                ssd_kv_stride_in_bytes=0,
+                chunk_size_in_bytes=self.block_stride_in_bytes,
+                block_stride_in_bytes=self.block_stride_in_bytes,
+                is_read=is_read,
+                num_blocks_per_file=self.num_blocks_per_file,
+                round_robin=self.round_robin,
+                num_threads_per_device=32,
+                is_mla=True,
+            )
+        else:
+            layer_id_list = torch.arange(0, self.num_layers, dtype=torch.int32)
+            transfer_kv_blocks_ssd(
+                ioctx=self.ioctx,
+                cpu_layer_id_list=layer_id_list,
+                cpu_tensor_ptr=self.cpu_layer_ptrs[0].item(),
+                ssd_block_ids=ssd_block_id_list,
+                cpu_block_ids=cpu_block_id_list,
+                cpu_layer_stride_in_bytes=self.cpu_layer_stride_in_bytes,
+                cpu_kv_stride_in_bytes=self.cpu_kv_stride_in_bytes,
+                ssd_layer_stride_in_bytes=self.ssd_layer_stride_in_bytes,
+                ssd_kv_stride_in_bytes=self.ssd_kv_stride_in_bytes,
+                chunk_size_in_bytes=self.chunk_size_in_bytes,
+                block_stride_in_bytes=self.block_stride_in_bytes,
+                is_read=is_read,
+                num_blocks_per_file=self.num_blocks_per_file,
+                round_robin=self.round_robin,
+                num_threads_per_device=32,
+                is_mla=self.is_mla,
+            )
 
     def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
         src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)

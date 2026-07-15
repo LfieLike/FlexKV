@@ -1,11 +1,16 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Dict, Optional, List, Tuple, Union
 
 import torch
 import hashlib
 
-from flexkv.common.config import GLOBAL_CONFIG_FROM_ENV, CacheConfig, ModelConfig
+from flexkv.common.config import (
+    GLOBAL_CONFIG_FROM_ENV,
+    CacheConfig,
+    LayerGroupSpec,
+    ModelConfig,
+)
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutType
@@ -17,6 +22,19 @@ from flexkv.storage.allocator import (
     RemoteAllocator,
     SSDAllocator,
 )
+
+
+def _resolve_layer_group_dtypes(
+    layer_groups: Optional[List[LayerGroupSpec]],
+    default_dtype: torch.dtype,
+) -> Optional[List[LayerGroupSpec]]:
+    """Resolve dtype inheritance before byte-flat layout allocation."""
+    if layer_groups is None:
+        return None
+    return [
+        group if group.dtype is not None else replace(group, dtype=default_dtype)
+        for group in layer_groups
+    ]
 
 
 class StorageEngine:
@@ -36,6 +54,48 @@ class StorageEngine:
         self._cache_config = cache_config
         self._indexer_config = cache_config.indexer
 
+        is_multi_group = self._model_config.layer_groups is not None
+        if is_multi_group:
+            if self._indexer_config is not None:
+                raise ValueError(
+                    "multi-group storage already includes sidecar/indexer pools; "
+                    "legacy CacheConfig.indexer must be unset"
+                )
+            if (
+                self._cache_config.enable_remote
+                or self._cache_config.use_mooncake_store_backend
+            ):
+                raise NotImplementedError(
+                    "multi-group Remote/Mooncake storage is not part of the "
+                    "current Layerwise CPU/SSD integration"
+                )
+            if GLOBAL_CONFIG_FROM_ENV.cpu_layout_type != KVCacheLayoutType.BLOCKFIRST:
+                raise ValueError(
+                    "multi-group storage requires FLEXKV_CPU_LAYOUT=BLOCKFIRST"
+                )
+            if (
+                self._cache_config.enable_ssd
+                and GLOBAL_CONFIG_FROM_ENV.ssd_layout_type
+                != KVCacheLayoutType.BLOCKFIRST
+            ):
+                raise ValueError(
+                    "multi-group storage requires FLEXKV_SSD_LAYOUT=BLOCKFIRST"
+                )
+
+            self._model_config.layer_groups = _resolve_layer_group_dtypes(
+                self._model_config.layer_groups,
+                self._model_config.dtype,
+            )
+
+        buffer_dtype = torch.uint8 if is_multi_group else self._model_config.dtype
+        if is_multi_group:
+            layout_tp_size = (
+                1 if self._model_config.use_mla
+                else self._model_config.effective_tp_size_per_node
+            )
+        else:
+            layout_tp_size = 1
+
         if self._cache_config.enable_cpu:
             self._cpu_layout: Optional[KVCacheLayout] = KVCacheLayout(
                 type=GLOBAL_CONFIG_FROM_ENV.cpu_layout_type,
@@ -44,15 +104,17 @@ class StorageEngine:
                 tokens_per_block=self._cache_config.tokens_per_block,
                 num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla
+                is_mla=self._model_config.use_mla,
+                layer_groups=self._model_config.layer_groups,
+                tp_size=layout_tp_size,
             )
             flexkv_logger.info(f"[StorageEngine] CPU layout: {self._cpu_layout}")
             self.allocate(
                 device_type=DeviceType.CPU,
                 layout=self._cpu_layout,
-                dtype=self._model_config.dtype,
+                dtype=buffer_dtype,
             )
-            if self._indexer_config is not None:
+            if self._indexer_config is not None and not is_multi_group:
                 # Indexer maps 1:1 with main KV blocks (each block = 1 page),
                 # so indexer num_blocks equals main KV num_blocks and
                 # tokens_per_block is 1 (one indexer entry per page).
@@ -82,16 +144,18 @@ class StorageEngine:
                 tokens_per_block=self._cache_config.tokens_per_block,
                 num_head=self._model_config.num_kv_heads_per_node,
                 head_size=self._model_config.head_size,
-                is_mla=self._model_config.use_mla
+                is_mla=self._model_config.use_mla,
+                layer_groups=self._model_config.layer_groups,
+                tp_size=layout_tp_size,
             )
             self.allocate(
                 device_type=DeviceType.SSD,
                 layout=self._ssd_layout,
-                dtype=self._model_config.dtype,
+                dtype=buffer_dtype,
                 cache_dir=self._cache_config.ssd_cache_dir,
                 max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb
             )
-            if self._indexer_config is not None:
+            if self._indexer_config is not None and not is_multi_group:
                 indexer_ssd_layout = KVCacheLayout(
                     type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
                     num_layer=num_layers_per_pp_stage,

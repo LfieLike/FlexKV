@@ -68,7 +68,7 @@ void LayerwiseTransferGroup::event_polling_loop() {
 struct LayerCallbackData {
   int start_layer;
   int layers_this_batch;
-  int num_gpus;
+  int expected_count;
   std::atomic<int> *counter;
   // Eventfd info for notification
   bool enable_eventfd;
@@ -85,7 +85,7 @@ struct LayerCallbackData {
 static void CUDART_CB layer_done_host_callback(void *userData) {
   LayerCallbackData *data = static_cast<LayerCallbackData *>(userData);
   int completed = data->counter->fetch_add(1) + 1;
-  if (completed == data->num_gpus) {
+  if (completed == data->expected_count) {
     // Notify via eventfd when all GPUs complete this layer batch
     if (data->enable_eventfd && data->layer_eventfds != nullptr) {
       // Signal each tp_rank's eventfd for completed layers
@@ -131,6 +131,7 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
     torch::Tensor indexer_gpu_chunk_sizes_tensor,
     std::map<int, std::vector<std::string>> indexer_ssd_files) {
 
+  has_multi_group_ = false;
   num_gpus_ = num_gpus;
   num_layers_ = num_layers;
   tp_size_ = tp_size;
@@ -302,6 +303,220 @@ LayerwiseTransferGroup::LayerwiseTransferGroup(
   }
 }
 
+LayerwiseTransferGroup::LayerwiseTransferGroup(
+    int num_gpus,
+    const std::vector<std::vector<std::vector<torch::Tensor>>>
+        &gpu_blocks_per_group,
+    torch::Tensor &cpu_blocks,
+    std::map<int, std::vector<std::string>> &ssd_files,
+    int num_original_layers,
+    const std::vector<std::vector<std::pair<int, int>>> &layer_members,
+    const std::vector<int> &group_num_layers,
+    const std::vector<int64_t> &group_cpu_offset_bytes,
+    const std::vector<int64_t> &group_ssd_offset_bytes,
+    const std::vector<int64_t> &group_cpu_layer_strides,
+    const std::vector<int64_t> &group_cpu_kv_strides,
+    const std::vector<int64_t> &group_ssd_layer_strides,
+    const std::vector<int64_t> &group_ssd_kv_strides,
+    const std::vector<int64_t> &group_chunk_sizes,
+    const std::vector<int64_t> &group_h2d_cpu_kv_strides,
+    const std::vector<int64_t> &group_h2d_cpu_layer_strides,
+    const std::vector<int64_t> &group_cpu_block_strides,
+    const std::vector<int64_t> &group_cpu_tp_strides,
+    const std::vector<int64_t> &group_gpu_kv_strides,
+    const std::vector<int64_t> &group_gpu_block_strides,
+    const std::vector<int64_t> &group_gpu_layer_strides,
+    const std::vector<int64_t> &group_gpu_chunk_sizes,
+    int iouring_entries, int iouring_flags,
+    torch::Tensor &layer_eventfds_tensor, int tp_size) {
+
+  if (num_gpus <= 0 || num_original_layers <= 0) {
+    throw std::runtime_error(
+        "[LayerwiseTransferGroup multi-group] num_gpus and "
+        "num_original_layers must be positive");
+  }
+
+  num_gpus_ = num_gpus;
+  num_layers_ = num_original_layers;
+  num_original_layers_ = num_original_layers;
+  tp_size_ = tp_size;
+  current_counter_id_ = 0;
+  has_multi_group_ = true;
+
+  num_tensors_per_gpu_ = 0;
+  gpu_blocks_ = nullptr;
+  gpu_kv_strides_in_bytes_ = nullptr;
+  gpu_block_strides_in_bytes_ = nullptr;
+  gpu_layer_strides_in_bytes_ = nullptr;
+  gpu_chunk_sizes_in_bytes_ = nullptr;
+
+  enable_eventfd_ = (layer_eventfds_tensor.numel() > 0);
+  if (enable_eventfd_) {
+    int total_fds = layer_eventfds_tensor.numel();
+    int fds_per_counter = tp_size * num_original_layers;
+    if (fds_per_counter <= 0 || total_fds % fds_per_counter != 0) {
+      throw std::runtime_error(
+          "[LayerwiseTransferGroup multi-group] invalid eventfd tensor size");
+    }
+    num_counters_ = total_fds / fds_per_counter;
+    int32_t *fds_ptr = layer_eventfds_tensor.data_ptr<int32_t>();
+    layer_eventfds_.assign(fds_ptr, fds_ptr + total_fds);
+  } else {
+    num_counters_ = 0;
+  }
+
+  layer_members_ = layer_members;
+  if (static_cast<int>(layer_members_.size()) != num_original_layers_) {
+    throw std::runtime_error(
+        "[LayerwiseTransferGroup multi-group] layer_members length " +
+        std::to_string(layer_members_.size()) + " does not match " +
+        std::to_string(num_original_layers_));
+  }
+
+  const int num_groups = static_cast<int>(group_num_layers.size());
+  if (num_groups <= 0 ||
+      static_cast<int>(gpu_blocks_per_group.size()) != num_groups) {
+    throw std::runtime_error(
+        "[LayerwiseTransferGroup multi-group] invalid group count");
+  }
+  auto require_group_count = [num_groups](const auto &values,
+                                          const char *name) {
+    if (static_cast<int>(values.size()) != num_groups) {
+      throw std::runtime_error(
+          std::string("[LayerwiseTransferGroup multi-group] ") + name +
+          " size does not match group count");
+    }
+  };
+  require_group_count(group_cpu_offset_bytes, "group_cpu_offset_bytes");
+  require_group_count(group_ssd_offset_bytes, "group_ssd_offset_bytes");
+  require_group_count(group_cpu_layer_strides, "group_cpu_layer_strides");
+  require_group_count(group_cpu_kv_strides, "group_cpu_kv_strides");
+  require_group_count(group_ssd_layer_strides, "group_ssd_layer_strides");
+  require_group_count(group_ssd_kv_strides, "group_ssd_kv_strides");
+  require_group_count(group_chunk_sizes, "group_chunk_sizes");
+  require_group_count(group_h2d_cpu_kv_strides,
+                      "group_h2d_cpu_kv_strides");
+  require_group_count(group_h2d_cpu_layer_strides,
+                      "group_h2d_cpu_layer_strides");
+  require_group_count(group_cpu_block_strides, "group_cpu_block_strides");
+  require_group_count(group_cpu_tp_strides, "group_cpu_tp_strides");
+
+  const int flattened_gpu_size = num_groups * num_gpus;
+  if (static_cast<int>(group_gpu_kv_strides.size()) != flattened_gpu_size ||
+      static_cast<int>(group_gpu_block_strides.size()) != flattened_gpu_size ||
+      static_cast<int>(group_gpu_layer_strides.size()) != flattened_gpu_size ||
+      static_cast<int>(group_gpu_chunk_sizes.size()) != flattened_gpu_size) {
+    throw std::runtime_error(
+        "[LayerwiseTransferGroup multi-group] flattened GPU stride size "
+        "does not match num_groups * num_gpus");
+  }
+
+  groups_.resize(num_groups);
+  for (int gi = 0; gi < num_groups; ++gi) {
+    GroupParams &group = groups_[gi];
+    group.num_layers = group_num_layers[gi];
+    group.cpu_offset_bytes = group_cpu_offset_bytes[gi];
+    group.ssd_offset_bytes = group_ssd_offset_bytes[gi];
+    group.cpu_layer_stride = group_cpu_layer_strides[gi];
+    group.cpu_kv_stride = group_cpu_kv_strides[gi];
+    group.ssd_layer_stride = group_ssd_layer_strides[gi];
+    group.ssd_kv_stride = group_ssd_kv_strides[gi];
+    group.chunk_size = group_chunk_sizes[gi];
+    group.h2d_cpu_kv_stride = group_h2d_cpu_kv_strides[gi];
+    group.h2d_cpu_layer_stride = group_h2d_cpu_layer_strides[gi];
+    group.cpu_block_stride = group_cpu_block_strides[gi];
+    group.cpu_tp_stride = group_cpu_tp_strides[gi];
+
+    group.gpu_kv_strides.resize(num_gpus);
+    group.gpu_block_strides.resize(num_gpus);
+    group.gpu_layer_strides.resize(num_gpus);
+    group.gpu_chunk_sizes.resize(num_gpus);
+    for (int device_idx = 0; device_idx < num_gpus; ++device_idx) {
+      int flat_idx = gi * num_gpus + device_idx;
+      group.gpu_kv_strides[device_idx] = group_gpu_kv_strides[flat_idx];
+      group.gpu_block_strides[device_idx] =
+          group_gpu_block_strides[flat_idx];
+      group.gpu_layer_strides[device_idx] =
+          group_gpu_layer_strides[flat_idx];
+      group.gpu_chunk_sizes[device_idx] = group_gpu_chunk_sizes[flat_idx];
+    }
+
+    if (static_cast<int>(gpu_blocks_per_group[gi].size()) != num_gpus) {
+      throw std::runtime_error(
+          "[LayerwiseTransferGroup multi-group] device count mismatch");
+    }
+    group.num_tensors_per_gpu =
+        static_cast<int>(gpu_blocks_per_group[gi][0].size());
+    if (group.num_tensors_per_gpu <= 0) {
+      throw std::runtime_error(
+          "[LayerwiseTransferGroup multi-group] empty GPU tensor list");
+    }
+    cudaMallocHost((void **)&group.gpu_blocks_flat,
+                   num_gpus * group.num_tensors_per_gpu * sizeof(void *));
+    for (int device_idx = 0; device_idx < num_gpus; ++device_idx) {
+      if (static_cast<int>(gpu_blocks_per_group[gi][device_idx].size()) !=
+          group.num_tensors_per_gpu) {
+        throw std::runtime_error(
+            "[LayerwiseTransferGroup multi-group] tensor count mismatch");
+      }
+      for (int tensor_idx = 0; tensor_idx < group.num_tensors_per_gpu;
+           ++tensor_idx) {
+        group.gpu_blocks_flat[device_idx * group.num_tensors_per_gpu +
+                              tensor_idx] =
+            gpu_blocks_per_group[gi][device_idx][tensor_idx].data_ptr();
+      }
+    }
+
+    if (group.num_tensors_per_gpu == 1) {
+      group.backend_type = BackendType::TRTLLM;
+    } else if (group.num_tensors_per_gpu == group.num_layers) {
+      group.backend_type = BackendType::VLLM;
+    } else if (group.num_tensors_per_gpu == group.num_layers * 2) {
+      group.backend_type = BackendType::SGLANG;
+    } else {
+      throw std::runtime_error(
+          "[LayerwiseTransferGroup multi-group] unsupported tensor layout "
+          "for group " + std::to_string(gi));
+    }
+
+    group.gpu_tensor_handlers.reserve(num_gpus);
+    for (int device_idx = 0; device_idx < num_gpus; ++device_idx) {
+      int64_t **gpu_blocks_ptr = reinterpret_cast<int64_t **>(
+          group.gpu_blocks_flat +
+          device_idx * group.num_tensors_per_gpu);
+      group.gpu_tensor_handlers.emplace_back(
+          group.backend_type, gpu_blocks_ptr, group.num_layers,
+          group.gpu_kv_strides[device_idx],
+          group.gpu_block_strides[device_idx],
+          group.gpu_layer_strides[device_idx]);
+    }
+  }
+
+  cpu_blocks_ = cpu_blocks.data_ptr();
+  gpu_device_ids_.resize(num_gpus_);
+  for (int device_idx = 0; device_idx < num_gpus_; ++device_idx) {
+    gpu_device_ids_[device_idx] =
+        gpu_blocks_per_group[0][device_idx][0].device().index();
+  }
+
+  streams_.resize(num_gpus_);
+  events_.resize(num_gpus_);
+  int least_priority, greatest_priority;
+  cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+  for (int device_idx = 0; device_idx < num_gpus_; ++device_idx) {
+    cudaSetDevice(gpu_device_ids_[device_idx]);
+    cudaStreamCreateWithPriority(&streams_[device_idx], cudaStreamNonBlocking,
+                                 greatest_priority);
+    cudaEventCreate(&events_[device_idx]);
+  }
+
+  enable_ssd_ = !ssd_files.empty();
+  if (enable_ssd_) {
+    ioctx_ = std::make_unique<SSDIOCTX>(ssd_files, ssd_files.size(),
+                                        iouring_entries, iouring_flags);
+  }
+}
+
 LayerwiseTransferGroup::~LayerwiseTransferGroup() {
   // Stop polling thread if running (only in POLLING mode)
   if (notify_mode_ == NotifyMode::POLLING) {
@@ -317,7 +532,16 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
     cudaEventDestroy(events_[i]);
   }
 
-  cudaFreeHost(gpu_blocks_);
+  if (gpu_blocks_ != nullptr) {
+    cudaFreeHost(gpu_blocks_);
+  }
+  for (auto &group : groups_) {
+    if (group.gpu_blocks_flat != nullptr) {
+      cudaFreeHost(group.gpu_blocks_flat);
+      group.gpu_blocks_flat = nullptr;
+    }
+    group.gpu_tensor_handlers.clear();
+  }
 
   gpu_tensor_handlers_.clear();
   delete[] gpu_kv_strides_in_bytes_;
@@ -338,10 +562,12 @@ LayerwiseTransferGroup::~LayerwiseTransferGroup() {
 
 void LayerwiseTransferGroup::layer_done_callback(int start_layer,
                                                  int layers_this_batch,
+                                                 int expected_count,
                                                  nvtxRangeId_t *current_range_id_ptr,
                                                  bool is_last_batch,
                                                  const char *next_range_name,
-                                                 nvtxRangeId_t *next_range_id_ptr) {
+                                                 nvtxRangeId_t *next_range_id_ptr,
+                                                 int callbacks_per_gpu) {
   std::atomic<int> *counter = new std::atomic<int>(0);
   
   // Get eventfd pointer for current counter set
@@ -353,15 +579,18 @@ void LayerwiseTransferGroup::layer_done_callback(int start_layer,
   }
   
   for (int i = 0; i < num_gpus_; ++i) {
-    LayerCallbackData *data = new LayerCallbackData{
-        start_layer, layers_this_batch, num_gpus_, counter,
-        enable_eventfd_, tp_size_, num_layers_, eventfds_ptr,
-        current_range_id_ptr, is_last_batch, {0}, next_range_id_ptr};
-    // Copy next range name
-    if (next_range_name != nullptr) {
-      snprintf(data->next_range_name, sizeof(data->next_range_name), "%s", next_range_name);
+    for (int callback_idx = 0; callback_idx < callbacks_per_gpu;
+         ++callback_idx) {
+      LayerCallbackData *data = new LayerCallbackData{
+          start_layer, layers_this_batch, expected_count, counter,
+          enable_eventfd_, tp_size_, num_layers_, eventfds_ptr,
+          current_range_id_ptr, is_last_batch, {0}, next_range_id_ptr};
+      if (next_range_name != nullptr) {
+        snprintf(data->next_range_name, sizeof(data->next_range_name), "%s",
+                 next_range_name);
+      }
+      cudaLaunchHostFunc(streams_[i], layer_done_host_callback, data);
     }
-    cudaLaunchHostFunc(streams_[i], layer_done_host_callback, data);
   }
 }
 
@@ -701,6 +930,7 @@ void LayerwiseTransferGroup::layerwise_transfer(
       nvtxRangeId_t *next_id_ptr = is_last_batch ? nullptr : &h2d_range_ids[batch_idx + 1];
 
       layer_done_callback(start_layer, layers_this_batch,
+                          num_gpus_,
                           &h2d_range_ids[batch_idx], is_last_batch,
                           next_name, next_id_ptr);
     }
@@ -803,6 +1033,212 @@ void LayerwiseTransferGroup::layerwise_transfer(
   cudaSetDevice(gpu_device_ids_[0]);
   for (int i = 0; i <= num_batches; ++i) {
     cudaEventDestroy(timing_events[i]);
+  }
+}
+
+void LayerwiseTransferGroup::layerwise_transfer_multi_group(
+    const torch::Tensor &ssd_block_ids,
+    const torch::Tensor &cpu_block_ids_d2h,
+    const int num_blocks_per_file, const int round_robin,
+    const int num_threads_per_device,
+    const torch::Tensor &gpu_block_id_tensor,
+    const torch::Tensor &cpu_block_id_tensor,
+    const int transfer_cta_num, const bool use_ce_transfer,
+    const bool is_mla, const int counter_id,
+    const std::string &notify_mode) {
+  if (!has_multi_group_) {
+    throw std::runtime_error(
+        "layerwise_transfer_multi_group() called on a single-group instance");
+  }
+  if (counter_id < 0 ||
+      (num_counters_ > 0 && counter_id >= num_counters_)) {
+    throw std::runtime_error(
+        "layerwise_transfer_multi_group() received invalid counter_id");
+  }
+
+  notify_mode_ = (notify_mode == "polling") ? NotifyMode::POLLING
+                                            : NotifyMode::HOSTFUNC;
+  current_counter_id_ = counter_id;
+
+  int num_blocks = gpu_block_id_tensor.numel();
+  int64_t *gpu_block_ids =
+      static_cast<int64_t *>(gpu_block_id_tensor.data_ptr());
+  int64_t *cpu_block_ids =
+      static_cast<int64_t *>(cpu_block_id_tensor.data_ptr());
+
+  // CPU and SSD use the same byte-flat BLOCKFIRST representation. Transfer
+  // each block as one opaque blob so very small compressed groups never issue
+  // sub-page IO independently.
+  if (enable_ssd_ && ssd_block_ids.numel() > 0) {
+    const int64_t block_stride = groups_[0].cpu_block_stride;
+    torch::Tensor one_layer_id =
+        torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32));
+    transfer_kv_blocks_ssd(
+        *ioctx_, one_layer_id, reinterpret_cast<int64_t>(cpu_blocks_),
+        ssd_block_ids, cpu_block_ids_d2h,
+        /*cpu_layer_stride_in_bytes=*/block_stride,
+        /*cpu_kv_stride_in_bytes=*/0,
+        /*ssd_layer_stride_in_bytes=*/block_stride,
+        /*ssd_kv_stride_in_bytes=*/0,
+        /*chunk_size_in_bytes=*/block_stride,
+        /*block_stride_in_bytes=*/block_stride,
+        /*is_read=*/true, num_blocks_per_file, round_robin,
+        num_threads_per_device, /*is_mla=*/true);
+  }
+
+  std::vector<int> active_layers;
+  active_layers.reserve(num_original_layers_);
+  for (int original_layer = 0; original_layer < num_original_layers_;
+       ++original_layer) {
+    if (!layer_members_[original_layer].empty()) {
+      active_layers.push_back(original_layer);
+    }
+  }
+
+  std::vector<nvtxRangeId_t> h2d_range_ids(num_original_layers_, 0);
+  std::vector<std::string> h2d_range_names(num_original_layers_);
+  if (notify_mode_ == NotifyMode::HOSTFUNC) {
+    for (int original_layer : active_layers) {
+      char range_name[160];
+      snprintf(range_name, sizeof(range_name),
+               "CPU->GPU OrigLayer[%d] members=%zu", original_layer,
+               layer_members_[original_layer].size());
+      h2d_range_names[original_layer] = range_name;
+    }
+    if (!active_layers.empty()) {
+      int first_layer = active_layers.front();
+      h2d_range_ids[first_layer] =
+          nvtxRangeStartA(h2d_range_names[first_layer].c_str());
+    }
+  } else {
+    poll_batches_.clear();
+    poll_batches_.resize(active_layers.size());
+  }
+
+  for (size_t active_idx = 0; active_idx < active_layers.size();
+       ++active_idx) {
+    int original_layer = active_layers[active_idx];
+    const auto &members = layer_members_[original_layer];
+
+    for (const auto &member : members) {
+      int group_idx = member.first;
+      int local_layer_id = member.second;
+      if (group_idx < 0 || group_idx >= static_cast<int>(groups_.size())) {
+        throw std::runtime_error(
+            "multi-group layer member contains invalid group index");
+      }
+      const GroupParams &group = groups_[group_idx];
+      if (local_layer_id < 0 || local_layer_id >= group.num_layers) {
+        throw std::runtime_error(
+            "multi-group layer member contains invalid local layer index");
+      }
+
+      for (int device_idx = 0; device_idx < num_gpus_; ++device_idx) {
+        cudaSetDevice(gpu_device_ids_[device_idx]);
+        int64_t cpu_startoff = device_idx * group.cpu_tp_stride;
+        if (is_mla) {
+          cpu_startoff = 0;
+        }
+        void *group_cpu_ptr =
+            static_cast<char *>(cpu_blocks_) + group.cpu_offset_bytes;
+        int64_t chunk_size = group.gpu_chunk_sizes[device_idx];
+
+        switch (group.backend_type) {
+        case BackendType::VLLM:
+          flexkv::transfer_kv_blocks<BackendType::VLLM>(
+              num_blocks, local_layer_id, 1, gpu_block_ids,
+              group.gpu_tensor_handlers[device_idx], 0, cpu_block_ids,
+              group_cpu_ptr, group.h2d_cpu_kv_stride,
+              group.h2d_cpu_layer_stride, group.cpu_block_stride,
+              cpu_startoff, chunk_size, streams_[device_idx], transfer_cta_num,
+              true, use_ce_transfer, is_mla, false);
+          break;
+        case BackendType::TRTLLM:
+          flexkv::transfer_kv_blocks<BackendType::TRTLLM>(
+              num_blocks, local_layer_id, 1, gpu_block_ids,
+              group.gpu_tensor_handlers[device_idx], 0, cpu_block_ids,
+              group_cpu_ptr, group.h2d_cpu_kv_stride,
+              group.h2d_cpu_layer_stride, group.cpu_block_stride,
+              cpu_startoff, chunk_size, streams_[device_idx], transfer_cta_num,
+              true, use_ce_transfer, is_mla, false);
+          break;
+        case BackendType::SGLANG:
+          flexkv::transfer_kv_blocks<BackendType::SGLANG>(
+              num_blocks, local_layer_id, 1, gpu_block_ids,
+              group.gpu_tensor_handlers[device_idx], 0, cpu_block_ids,
+              group_cpu_ptr, group.h2d_cpu_kv_stride,
+              group.h2d_cpu_layer_stride, group.cpu_block_stride,
+              cpu_startoff, chunk_size, streams_[device_idx], transfer_cta_num,
+              true, use_ce_transfer, is_mla, false);
+          break;
+        }
+      }
+    }
+
+    if (notify_mode_ == NotifyMode::POLLING) {
+      PollBatchInfo &poll_batch = poll_batches_[active_idx];
+      poll_batch.start_layer = original_layer;
+      poll_batch.layers_this_batch = 1;
+      poll_batch.notified = false;
+      poll_batch.per_gpu_events.resize(num_gpus_);
+      for (int device_idx = 0; device_idx < num_gpus_; ++device_idx) {
+        cudaSetDevice(gpu_device_ids_[device_idx]);
+        cudaEventCreateWithFlags(&poll_batch.per_gpu_events[device_idx],
+                                 cudaEventDisableTiming);
+        cudaEventRecord(poll_batch.per_gpu_events[device_idx],
+                        streams_[device_idx]);
+      }
+    } else {
+      bool is_last = active_idx + 1 == active_layers.size();
+      int next_layer = is_last ? -1 : active_layers[active_idx + 1];
+      const char *next_name =
+          is_last ? nullptr : h2d_range_names[next_layer].c_str();
+      nvtxRangeId_t *next_id =
+          is_last ? nullptr : &h2d_range_ids[next_layer];
+      int callbacks_per_gpu = static_cast<int>(members.size());
+      layer_done_callback(
+          original_layer, 1, callbacks_per_gpu * num_gpus_,
+          &h2d_range_ids[original_layer], is_last, next_name, next_id,
+          callbacks_per_gpu);
+    }
+  }
+
+  if (notify_mode_ == NotifyMode::POLLING && !poll_batches_.empty()) {
+    poll_stop_.store(true, std::memory_order_release);
+    if (poll_thread_.joinable()) {
+      poll_thread_.join();
+    }
+    poll_stop_.store(false, std::memory_order_release);
+    poll_next_batch_.store(0, std::memory_order_release);
+    poll_thread_ =
+        std::thread(&LayerwiseTransferGroup::event_polling_loop, this);
+  }
+
+  for (int device_idx = 0; device_idx < num_gpus_; ++device_idx) {
+    cudaSetDevice(gpu_device_ids_[device_idx]);
+    cudaError_t error = cudaStreamSynchronize(streams_[device_idx]);
+    if (error != cudaSuccess) {
+      poll_stop_.store(true, std::memory_order_release);
+      if (poll_thread_.joinable()) {
+        poll_thread_.join();
+      }
+      throw std::runtime_error(
+          "layerwise_transfer_multi_group failed on GPU " +
+          std::to_string(device_idx) + ": " + cudaGetErrorString(error));
+    }
+  }
+
+  if (notify_mode_ == NotifyMode::POLLING) {
+    if (poll_thread_.joinable()) {
+      poll_thread_.join();
+    }
+    poll_stop_.store(true, std::memory_order_release);
+    for (auto &poll_batch : poll_batches_) {
+      for (int device_idx = 0; device_idx < num_gpus_; ++device_idx) {
+        cudaSetDevice(gpu_device_ids_[device_idx]);
+        cudaEventDestroy(poll_batch.per_gpu_events[device_idx]);
+      }
+    }
   }
 }
 
