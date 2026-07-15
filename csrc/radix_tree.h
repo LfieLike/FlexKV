@@ -156,7 +156,7 @@ public:
   bool has_swa() { return !swa_tombstone && swa_host_slot >= 0; }
 
   // True once the mounted SWA slot is published and safe to match / LRU-evict.
-  bool is_swa_ready() { return swa_ready; }
+  bool is_swa_ready() const { return swa_ready; }
 
   void set_swa_ready(bool ready) { swa_ready = ready; }
 
