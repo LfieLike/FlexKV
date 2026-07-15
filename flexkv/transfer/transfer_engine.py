@@ -35,6 +35,7 @@ from flexkv.transfer.worker import (
     CPUSSDDiskTransferWorker,
     CPURemoteTransferWorker,
     GPUCPUTransferWorker,
+    MultiGroupGPUCPUTransferWorker,
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
     tpGDSTransferWorker,
@@ -101,7 +102,9 @@ class TransferEngine:
         indexer_gpu_handles: Optional[Dict[WorkerKey, List[StorageHandle]]] = None,
         indexer_cpu_handle: Optional[StorageHandle] = None,
         indexer_ssd_handle: Optional[StorageHandle] = None,
-        indexer_remote_handle: Optional[StorageHandle] = None):
+        indexer_remote_handle: Optional[StorageHandle] = None,
+        gpu_blocks_per_group: Optional[Dict[WorkerKey, List]] = None,
+        gpu_layouts_per_group: Optional[Dict[WorkerKey, List]] = None):
         """
         Initialize transfer engine
 
@@ -116,10 +119,16 @@ class TransferEngine:
                 CPU-pool-local start_layer_id (global pp_start_layer minus the minimum
                 pp_start_layer on this node). Required for single-node PP>1 deployments
                 where multiple PP stages share one TransferManager and CPU pool.
+            gpu_blocks_per_group: Optional device-major heterogeneous GPU
+                handles. For each WorkerKey the shape is [device][group][tensor].
+            gpu_layouts_per_group: Optional device-major heterogeneous GPU
+                layouts. For each WorkerKey the shape is [device][group].
         """
         self.model_config: ModelConfig = model_config
         self.cache_config: CacheConfig = cache_config
 
+        if not gpu_handles or any(not handles for handles in gpu_handles.values()):
+            raise ValueError("gpu_handles must contain at least one handle per WorkerKey")
         first_handles = next(iter(gpu_handles.values()))
         self._num_layers_for_local_pp_stage = first_handles[0].kv_layout.num_layer
 
@@ -158,6 +167,41 @@ class TransferEngine:
         self._indexer_ssd_handle = indexer_ssd_handle
         self._indexer_remote_handle = indexer_remote_handle
 
+        self._has_multi_group = self.model_config.layer_groups is not None
+        self._gpu_blocks_per_group = gpu_blocks_per_group
+        self._gpu_layouts_per_group = gpu_layouts_per_group
+        if self._has_multi_group:
+            if gpu_blocks_per_group is None or gpu_layouts_per_group is None:
+                raise ValueError(
+                    "ModelConfig.layer_groups requires gpu_blocks_per_group and "
+                    "gpu_layouts_per_group"
+                )
+            expected_keys = set(self.gpu_handle_groups)
+            if set(gpu_blocks_per_group) != expected_keys:
+                raise ValueError(
+                    "gpu_blocks_per_group WorkerKeys do not match gpu_handles"
+                )
+            if set(gpu_layouts_per_group) != expected_keys:
+                raise ValueError(
+                    "gpu_layouts_per_group WorkerKeys do not match gpu_handles"
+                )
+            if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+                raise NotImplementedError(
+                    "multi-group GPU restore currently requires layerwise transfer"
+                )
+            if any(
+                start_layer_id != 0
+                for start_layer_id in self._worker_key_to_start_layer_id.values()
+            ):
+                raise NotImplementedError(
+                    "multi-group transfer does not yet support a non-zero PP "
+                    "start_layer_id"
+                )
+            if self._indexer_gpu_handles is not None:
+                raise ValueError(
+                    "multi-group transfer cannot be mixed with legacy indexer handles"
+                )
+
         self.pin_buffer = SharedOpPool(2048, self.cache_config.num_cpu_blocks)
 
         self.op_id_to_nvtx_range: Dict[int, str] = {}
@@ -177,6 +221,58 @@ class TransferEngine:
             gpu_handle_groups=self.gpu_handle_groups,
             layerwise_enabled=GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer,
         )
+
+    def _get_multi_group_payload(
+        self,
+        worker_key: WorkerKey,
+    ) -> Tuple[List[List[List]], List[List]]:
+        """Transpose one Worker's registration from device-major to group-major."""
+        if not self._has_multi_group:
+            raise RuntimeError("multi-group payload requested for a uniform model")
+        assert self.model_config.layer_groups is not None
+        assert self._gpu_blocks_per_group is not None
+        assert self._gpu_layouts_per_group is not None
+
+        device_blocks = self._gpu_blocks_per_group[worker_key]
+        device_layouts = self._gpu_layouts_per_group[worker_key]
+        tp_group_size = self.model_config.effective_tp_size_per_node
+        num_groups = len(self.model_config.layer_groups)
+        if len(device_blocks) != tp_group_size:
+            raise ValueError(
+                f"{worker_key} registered {len(device_blocks)} multi-group devices; "
+                f"expected {tp_group_size}"
+            )
+        if len(device_layouts) != tp_group_size:
+            raise ValueError(
+                f"{worker_key} registered {len(device_layouts)} multi-group "
+                f"layout sets; expected {tp_group_size}"
+            )
+
+        blocks_by_group: List[List[List]] = [[] for _ in range(num_groups)]
+        layouts_by_group: List[List] = [[] for _ in range(num_groups)]
+        for device_idx, (groups_for_device, layouts_for_device) in enumerate(zip(
+            device_blocks,
+            device_layouts,
+        )):
+            if groups_for_device is None or len(groups_for_device) != num_groups:
+                raise ValueError(
+                    f"{worker_key} device {device_idx} GPU handle group count "
+                    f"does not match layer_groups"
+                )
+            if layouts_for_device is None or len(layouts_for_device) != num_groups:
+                raise ValueError(
+                    f"{worker_key} device {device_idx} GPU layout group count "
+                    f"does not match layer_groups"
+                )
+            for group_idx in range(num_groups):
+                if not groups_for_device[group_idx]:
+                    raise ValueError(
+                        f"{worker_key} device {device_idx} group {group_idx} "
+                        "has no GPU handles"
+                    )
+                blocks_by_group[group_idx].append(groups_for_device[group_idx])
+                layouts_by_group[group_idx].append(layouts_for_device[group_idx])
+        return blocks_by_group, layouts_by_group
 
     def _init_workers(self) -> None:
         if self._running:
@@ -239,8 +335,43 @@ class TransferEngine:
                 }
             self._worker_map[TransferType.H2D] = self.h2d_workers
 
-        # D2H worker
-        if self.model_config.effective_tp_size_per_node == 1:
+        # D2H worker. Heterogeneous groups share one byte-flat CPU block, so
+        # all TP devices and all groups must participate in the same worker.
+        if self._has_multi_group:
+            assert self.model_config.layer_groups is not None
+            self.d2h_workers = {}
+            for worker_key in self.gpu_handle_groups:
+                blocks_by_group, layouts_by_group = (
+                    self._get_multi_group_payload(worker_key)
+                )
+                self.d2h_workers[worker_key] = (
+                    MultiGroupGPUCPUTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                        cpu_kv_layout=self._cpu_handle.kv_layout,
+                        layer_groups=self.model_config.layer_groups,
+                        gpu_blocks_per_group=blocks_by_group,
+                        gpu_layouts_per_group=layouts_by_group,
+                        tp_group_size=(
+                            self.model_config.effective_tp_size_per_node
+                        ),
+                        use_ce_transfer_h2d=(
+                            GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d
+                        ),
+                        use_ce_transfer_d2h=(
+                            GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h
+                        ),
+                        transfer_num_cta_h2d=(
+                            GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_h2d
+                        ),
+                        transfer_num_cta_d2h=(
+                            GLOBAL_CONFIG_FROM_ENV.transfer_num_cta_d2h
+                        ),
+                    )
+                )
+        elif self.model_config.effective_tp_size_per_node == 1:
             self.d2h_workers: Dict[WorkerKey, WorkerHandle] = {
                 worker_key: GPUCPUTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
@@ -299,6 +430,7 @@ class TransferEngine:
                     num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
                     cache_config=self._cache_config,
                     compressor=self._compressors["cpu_ssd"],
+                    layer_groups=self.model_config.layer_groups,
                 )
                 self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
 
@@ -315,6 +447,7 @@ class TransferEngine:
                 num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
                 cache_config=self._cache_config,
                 compressor=self._compressors["cpu_ssd"],
+                layer_groups=self.model_config.layer_groups,
             )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
         if self._remote_handle is not None and self._cpu_handle is not None:
@@ -441,6 +574,12 @@ class TransferEngine:
 
             self.layerwise_workers: Dict[WorkerKey, WorkerHandle] = {}
             for worker_key, gpu_handles in self.gpu_handle_groups.items():
+                blocks_by_group = None
+                layouts_by_group = None
+                if self._has_multi_group:
+                    blocks_by_group, layouts_by_group = (
+                        self._get_multi_group_payload(worker_key)
+                    )
                 _layerwise_eventfd_socket = build_layerwise_eventfd_socket_path(
                     dp_client_id=worker_key.dp_client_id,
                     pp_rank=worker_key.pp_rank,
@@ -478,13 +617,20 @@ class TransferEngine:
                     indexer_ssd_files=self._indexer_ssd_handle.get_file_list() if (idx_handles and self._indexer_ssd_handle) else None,
                     indexer_ssd_kv_layout=self._indexer_ssd_handle.kv_layout if (idx_handles and self._indexer_ssd_handle) else None,
                     indexer_num_blocks_per_file=self._indexer_ssd_handle.num_blocks_per_file if (idx_handles and self._indexer_ssd_handle) else 0,
+                    layer_groups=(
+                        self.model_config.layer_groups
+                        if self._has_multi_group else None
+                    ),
+                    gpu_blocks_per_group=blocks_by_group,
+                    gpu_layouts_per_group=layouts_by_group,
                 )
                 self.layerwise_workers[worker_key] = worker
 
                 flexkv_logger.debug(
                     f"[TransferEngine] Created layerwise worker for {worker_key}: "
                     f"effective_tp_size_per_node={self.model_config.effective_tp_size_per_node}, has_indexer={idx_handles is not None}, "
-                    f"has_ssd={len(ssd_files) > 0}")
+                    f"has_ssd={len(ssd_files) > 0}, "
+                    f"multi_group={self._has_multi_group}")
 
             self._worker_map[TransferType.LAYERWISE] = self.layerwise_workers
 

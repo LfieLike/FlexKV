@@ -20,7 +20,13 @@ import pickle
 import sys
 
 from flexkv.common.transfer import TransferOpGraph, CompletedOp, WorkerKey
-from flexkv.common.config import CacheConfig, ModelConfig
+from flexkv.common.config import (
+    GLOBAL_CONFIG_FROM_ENV,
+    CacheConfig,
+    LayerGroupSpec,
+    ModelConfig,
+    recompute_cache_block_counts,
+)
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle
 from flexkv.common.transfer import DeviceType
@@ -48,6 +54,16 @@ class TransferManager:
         self.gpu_worker_key_mapping: Dict[int, WorkerKey] = {}
         self.gpu_pp_start_layer_mapping: Dict[int, int] = {}  # device_id -> pp_start_layer
 
+        # Per-device heterogeneous registration data. The outer list is group
+        # order; TransferEngine later transposes device-major registration into
+        # group-major worker arguments.
+        self.all_gpu_layouts_per_group: Dict[
+            int, Optional[List[KVCacheLayout]]
+        ] = {}
+        self.all_gpu_blocks_per_group: Dict[
+            int, Optional[List[List[TensorSharedHandle]]]
+        ] = {}
+
         # Indexer GPU registration data
         self.all_indexer_gpu_blocks: Dict[int, List[TensorSharedHandle]] = {}  # device_id -> indexer_gpu_blocks
         self.all_indexer_gpu_layouts: Dict[int, KVCacheLayout] = {}
@@ -61,29 +77,155 @@ class TransferManager:
         flexkv_logger.info(f"Initialized TransferManager with config successfully, "
                            f"instance_num={self.instance_num}, expected_gpus={self.expected_gpus}")
 
+    def _normalized_group_signature(
+        self,
+        layer_groups: List[LayerGroupSpec],
+    ) -> Tuple[Tuple[Any, ...], ...]:
+        return tuple(
+            (
+                group.num_layers,
+                group.num_kv_heads,
+                group.head_size,
+                tuple(group.layer_indices),
+                group.sliding_window,
+                group.dtype or self.model_config.dtype,
+                group.compress_ratio,
+            )
+            for group in layer_groups
+        )
+
+    def _validate_multi_group_registration(
+        self,
+        req: RegisterTPClientRequest,
+    ) -> bool:
+        values = (
+            req.layer_groups,
+            req.gpu_layouts_per_group,
+            req.handles_per_group,
+        )
+        has_any = any(value is not None for value in values)
+        has_all = all(value is not None for value in values)
+        if has_any and not has_all:
+            raise ValueError(
+                "layer_groups, gpu_layouts_per_group and handles_per_group "
+                "must be registered together"
+            )
+        if not has_all:
+            return False
+
+        assert req.layer_groups is not None
+        assert req.gpu_layouts_per_group is not None
+        assert req.handles_per_group is not None
+        if not req.handles:
+            raise ValueError("aggregate GPU handles must not be empty")
+        if req.indexer_handles is not None or req.indexer_gpu_layout is not None:
+            raise ValueError(
+                "multi-group registration cannot be mixed with legacy indexer fields"
+            )
+        if self.cache_config.indexer is not None:
+            raise ValueError(
+                "multi-group registration requires CacheConfig.indexer to be unset"
+            )
+        if self.model_config.layer_groups is None:
+            raise RuntimeError(
+                "DSv4 layer_groups must be configured and cache capacity must "
+                "be recomputed before KVManager/TransferManager starts"
+            )
+        if self._normalized_group_signature(req.layer_groups) != (
+            self._normalized_group_signature(self.model_config.layer_groups)
+        ):
+            raise ValueError(
+                "registered layer_groups do not match ModelConfig.layer_groups"
+            )
+
+        num_groups = len(req.layer_groups)
+        if num_groups == 0:
+            raise ValueError("multi-group registration requires at least one group")
+        if len(req.gpu_layouts_per_group) != num_groups:
+            raise ValueError("registered GPU layout count does not match group count")
+        if len(req.handles_per_group) != num_groups:
+            raise ValueError("registered GPU handle count does not match group count")
+        if req.gpu_layout.num_layer != self.model_config.num_layers:
+            raise ValueError(
+                "aggregate gpu_layout.num_layer must use the original-layer "
+                f"index space ({self.model_config.num_layers}), got "
+                f"{req.gpu_layout.num_layer}"
+            )
+
+        for group_idx, (group, layout, handles) in enumerate(zip(
+            req.layer_groups,
+            req.gpu_layouts_per_group,
+            req.handles_per_group,
+        )):
+            expected_tokens = (
+                self.cache_config.tokens_per_block // group.compress_ratio
+            )
+            if not handles:
+                raise ValueError(
+                    f"handles_per_group[{group_idx}] must not be empty"
+                )
+            if len(handles) not in {
+                1,
+                group.num_layers,
+                group.num_layers * 2,
+            }:
+                raise ValueError(
+                    f"handles_per_group[{group_idx}] has an unsupported tensor "
+                    "count"
+                )
+            if layout.layer_groups is not None:
+                raise ValueError(
+                    f"gpu_layouts_per_group[{group_idx}] must be homogeneous"
+                )
+            if (
+                layout.num_layer != group.num_layers
+                or layout.num_block != req.gpu_layout.num_block
+                or layout.tokens_per_block != expected_tokens
+                or layout.num_head != group.num_kv_heads
+                or layout.head_size != group.head_size
+                or layout.is_mla != req.gpu_layout.is_mla
+            ):
+                raise ValueError(
+                    f"gpu_layouts_per_group[{group_idx}] does not match its "
+                    "LayerGroupSpec"
+                )
+        return True
+
     def _handle_gpu_blocks_registration(self, req: RegisterTPClientRequest) -> None:
         device_id = req.device_id
 
         if device_id in self.all_gpu_blocks:
-            flexkv_logger.error(f"GPU {device_id} has already registered.")
-        else:
-            try:
-                self.all_gpu_blocks[device_id] = req.handles
-                self.all_gpu_layouts[device_id] = req.gpu_layout
-                self.gpu_worker_key_mapping[device_id] = WorkerKey(
-                    dp_client_id=req.dp_client_id,
-                    pp_rank=req.pp_rank,
-                )
-                self.gpu_pp_start_layer_mapping[device_id] = req.pp_start_layer
-                # Store indexer GPU data if present
-                if req.indexer_handles is not None:
-                    self.all_indexer_gpu_blocks[device_id] = req.indexer_handles
-                    self.all_indexer_gpu_layouts[device_id] = req.indexer_gpu_layout
-                    flexkv_logger.info(
-                        f"GPU {device_id}: registered indexer handles "
-                        f"({len(req.indexer_handles)} layers)")
-            except Exception as e:
-                flexkv_logger.error(f"Failed to register GPU {device_id}: {e}")
+            raise ValueError(f"GPU {device_id} has already registered")
+        if not req.handles:
+            raise ValueError("aggregate GPU handles must not be empty")
+        if (req.indexer_handles is None) != (req.indexer_gpu_layout is None):
+            raise ValueError(
+                "indexer_handles and indexer_gpu_layout must be registered together"
+            )
+
+        is_multi_group = self._validate_multi_group_registration(req)
+        self.all_gpu_blocks[device_id] = req.handles
+        self.all_gpu_layouts[device_id] = req.gpu_layout
+        self.gpu_worker_key_mapping[device_id] = WorkerKey(
+            dp_client_id=req.dp_client_id,
+            pp_rank=req.pp_rank,
+        )
+        self.gpu_pp_start_layer_mapping[device_id] = req.pp_start_layer
+        self.all_gpu_blocks_per_group[device_id] = (
+            req.handles_per_group if is_multi_group else None
+        )
+        self.all_gpu_layouts_per_group[device_id] = (
+            req.gpu_layouts_per_group if is_multi_group else None
+        )
+
+        # Store legacy indexer GPU data only on the uniform path.
+        if req.indexer_handles is not None:
+            assert req.indexer_gpu_layout is not None
+            self.all_indexer_gpu_blocks[device_id] = req.indexer_handles
+            self.all_indexer_gpu_layouts[device_id] = req.indexer_gpu_layout
+            flexkv_logger.info(
+                f"GPU {device_id}: registered indexer handles "
+                f"({len(req.indexer_handles)} layers)")
 
     def _register_gpu_blocks_via_socket(self) -> None:
         try:
@@ -139,6 +281,71 @@ class TransferManager:
             f"Expected {self.expected_gpus} GPU layouts, got {len(self.all_gpu_layouts)}"
         assert len(self.all_gpu_blocks) == self.expected_gpus, \
             f"Expected {self.expected_gpus} GPU blocks, got {len(self.all_gpu_blocks)}"
+
+        has_multi_group = self.model_config.layer_groups is not None
+        if has_multi_group:
+            assert self.model_config.layer_member_map is not None
+            uncovered_layers = [
+                layer_id
+                for layer_id, members in enumerate(
+                    self.model_config.layer_member_map.members
+                )
+                if not members
+            ]
+            if uncovered_layers:
+                raise ValueError(
+                    "multi-group Layerwise requires every original layer to "
+                    f"belong to at least one group; uncovered={uncovered_layers}"
+                )
+            if not GLOBAL_CONFIG_FROM_ENV.enable_layerwise_transfer:
+                raise RuntimeError(
+                    "multi-group integration currently requires "
+                    "FLEXKV_ENABLE_LAYERWISE_TRANSFER=1"
+                )
+            if self.model_config.pp_size != 1:
+                raise NotImplementedError(
+                    "multi-group PP layer remapping is not implemented yet; "
+                    "use pp_size=1 for this integration stage"
+                )
+            if self.model_config.nnodes != 1 or self.model_config.cp_size != 1:
+                raise NotImplementedError(
+                    "multi-group integration currently supports single-node "
+                    "TP with cp_size=1"
+                )
+            if (
+                self.cache_config.enable_gds
+                or self.cache_config.enable_remote
+                or self.cache_config.enable_kv_sharing
+                or self.cache_config.use_mooncake_store_backend
+            ):
+                raise NotImplementedError(
+                    "multi-group integration currently supports CPU and optional "
+                    "SSD only; GDS/Remote/P2P/Mooncake paths are deferred"
+                )
+            if any(
+                self.all_gpu_blocks_per_group.get(device_id) is None
+                or self.all_gpu_layouts_per_group.get(device_id) is None
+                for device_id in self.all_gpu_blocks
+            ):
+                raise RuntimeError(
+                    "ModelConfig.layer_groups is set but one or more GPUs "
+                    "registered only the legacy uniform layout"
+                )
+
+            old_cpu_blocks = self.cache_config.num_cpu_blocks
+            old_ssd_blocks = self.cache_config.num_ssd_blocks
+            if recompute_cache_block_counts(
+                self.model_config,
+                self.cache_config,
+            ):
+                self.cache_config.num_cpu_blocks = old_cpu_blocks
+                self.cache_config.num_ssd_blocks = old_ssd_blocks
+                raise RuntimeError(
+                    "heterogeneous cache capacity was stale at GPU registration; "
+                    "configure layer_groups and call recompute_cache_block_counts "
+                    "before constructing KVManager so CacheEngine and StorageEngine "
+                    "use identical block counts"
+                )
 
         # Compute total layers on this node: sum up num_layer for each distinct pp_rank.
         # In single-node PP>1 deployments, multiple pp_ranks share this TransferManager,
@@ -213,12 +420,27 @@ class TransferManager:
 
         # Group GPU handles by WorkerKey
         grouped_gpu_handles: Dict[WorkerKey, List] = {}
+        grouped_gpu_blocks_per_group: Optional[Dict[WorkerKey, List]] = (
+            {} if has_multi_group else None
+        )
+        grouped_gpu_layouts_per_group: Optional[Dict[WorkerKey, List]] = (
+            {} if has_multi_group else None
+        )
         for device_id in sorted(self.all_gpu_blocks.keys()):
             worker_key = self.gpu_worker_key_mapping[device_id]
             if worker_key not in grouped_gpu_handles:
                 grouped_gpu_handles[worker_key] = []
             grouped_gpu_handles[worker_key].append(
                 self.storage_engine.get_storage_handle(DeviceType.GPU, device_id))
+            if has_multi_group:
+                assert grouped_gpu_blocks_per_group is not None
+                assert grouped_gpu_layouts_per_group is not None
+                grouped_gpu_blocks_per_group.setdefault(worker_key, []).append(
+                    self.all_gpu_blocks_per_group[device_id]
+                )
+                grouped_gpu_layouts_per_group.setdefault(worker_key, []).append(
+                    self.all_gpu_layouts_per_group[device_id]
+                )
 
         cpu_handle = self.storage_engine.get_storage_handle(DeviceType.CPU) \
             if self.cache_config.enable_cpu else None
@@ -270,6 +492,8 @@ class TransferManager:
             indexer_cpu_handle=indexer_cpu_handle,
             indexer_ssd_handle=indexer_ssd_handle,
             indexer_remote_handle=indexer_remote_handle,
+            gpu_blocks_per_group=grouped_gpu_blocks_per_group,
+            gpu_layouts_per_group=grouped_gpu_layouts_per_group,
         )
 
         flexkv_logger.info(f"Initialized TransferEngine successfully, "
