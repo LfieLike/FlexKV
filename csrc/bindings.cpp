@@ -765,7 +765,7 @@ PYBIND11_MODULE(c_ext, m) {
                     &flexkv::CRadixNode::set_swa_host_slot)
       .def_property("swa_tombstone", &flexkv::CRadixNode::get_swa_tombstone,
                     &flexkv::CRadixNode::set_swa_tombstone)
-      .def_property("swa_ready", &flexkv::CRadixNode::swa_ready,
+      .def_property("swa_ready", &flexkv::CRadixNode::is_swa_ready,
                     &flexkv::CRadixNode::set_swa_ready)
       .def_property_readonly("swa_lock_ref",
                              &flexkv::CRadixNode::get_swa_lock_ref)

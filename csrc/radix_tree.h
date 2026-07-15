@@ -519,7 +519,7 @@ public:
   CRadixNode *swa_lru_get_lru_unlocked() {
     CRadixNode *x = swa_lru_tail->get_swa_lru_prev();
     while (x != swa_lru_head &&
-           (x->get_swa_lock_ref() > 0 || !x->swa_ready())) {
+           (x->get_swa_lock_ref() > 0 || !x->is_swa_ready())) {
       x = x->get_swa_lru_prev();
     }
     return x != swa_lru_head ? x : nullptr;
@@ -531,6 +531,7 @@ public:
     assert(node != root);
     int old = node->get_swa_host_slot();
     assert(old == -1 || old == slot);
+    (void)old;
     node->set_swa_host_slot(slot);
     node->set_swa_tombstone(false);
     node->set_swa_ready(false);
@@ -545,7 +546,7 @@ public:
   void publish_swa(CRadixNode *node) {
     assert(node != root);
     assert(node->has_swa());
-    if (node->swa_ready()) {
+    if (node->is_swa_ready()) {
       return;
     }
     node->set_swa_ready(true);

@@ -220,7 +220,7 @@ void CRadixNode::merge_child() {
   // buffering its slot for release (the slot is being kept, not freed).
   index->record_freed_swa_slot(this); // release parent's old SWA (if any)
   int child_slot = child->get_swa_host_slot();
-  bool child_published = child->swa_ready();
+  bool child_published = child->is_swa_ready();
   if (child_slot != -1) {
     index->swa_lru_remove(child); // detach child from SWA-LRU
     child->set_swa_host_slot(-1); // child no longer owns it
